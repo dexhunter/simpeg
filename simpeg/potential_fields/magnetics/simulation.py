@@ -586,6 +586,11 @@ class Simulation3DIntegral(BasePFSimulation):
         dx = dr[..., 0]
         dy = dr[..., 1]
         dz = dr[..., 2]
+        if type(dr) is np.ndarray:
+            # Prism kernels reuse each coordinate across several components.
+            dx = np.ascontiguousarray(dx)
+            dy = np.ascontiguousarray(dy)
+            dz = np.ascontiguousarray(dz)
 
         node_evals = {}
         if "bx" in components or "tmi" in components:
@@ -652,8 +657,46 @@ class Simulation3DIntegral(BasePFSimulation):
         ## Hyz = gxyz * m_x + gyyz * m_y + gzzy * m_z
         ## Hzz = gzzx * m_x + gzzy * m_y + gzzz * m_z
 
+        cell_evals = {}
+
+        def reduce_to_cells(values):
+            key = id(values)
+            if key not in cell_evals:
+                indices = self._unique_inv
+                if (
+                    type(values) is np.ndarray
+                    and type(indices) is np.ndarray
+                    and indices.dtype.kind in "iu"
+                ):
+                    corners = np.take(values, indices, axis=0)
+                else:
+                    corners = values[indices] if indices is not None else values
+                if type(corners) is np.ndarray and corners.dtype.kind == "f":
+                    reduced = corners[0] - corners[1]
+                    reduced -= corners[2]
+                    reduced += corners[3]
+                    reduced -= corners[4]
+                    reduced += corners[5]
+                    reduced += corners[6]
+                    reduced -= corners[7]
+                else:
+                    reduced = (
+                        corners[0]
+                        - corners[1]
+                        - corners[2]
+                        + corners[3]
+                        - corners[4]
+                        + corners[5]
+                        + corners[6]
+                        - corners[7]
+                    )
+                # Retain the source so projected TMI arrays cannot reuse its id.
+                cell_evals[key] = (values, reduced)
+            return cell_evals[key][1]
+
         rows = {}
         M = self.M
+        magnetization_ready = False
         for component in set(components):
             if component == "bx":
                 vals_x = node_evals["gxx"]
@@ -759,46 +802,26 @@ class Simulation3DIntegral(BasePFSimulation):
                 vals_x = node_evals["gzzx"]
                 vals_y = node_evals["gzzy"]
                 vals_z = node_evals["gzzz"]
-            if self._unique_inv is not None:
-                vals_x = vals_x[self._unique_inv]
-                vals_y = vals_y[self._unique_inv]
-                vals_z = vals_z[self._unique_inv]
-
-            cell_eval_x = (
-                vals_x[0]
-                - vals_x[1]
-                - vals_x[2]
-                + vals_x[3]
-                - vals_x[4]
-                + vals_x[5]
-                + vals_x[6]
-                - vals_x[7]
-            )
-            cell_eval_y = (
-                vals_y[0]
-                - vals_y[1]
-                - vals_y[2]
-                + vals_y[3]
-                - vals_y[4]
-                + vals_y[5]
-                + vals_y[6]
-                - vals_y[7]
-            )
-            cell_eval_z = (
-                vals_z[0]
-                - vals_z[1]
-                - vals_z[2]
-                + vals_z[3]
-                - vals_z[4]
-                + vals_z[5]
-                + vals_z[6]
-                - vals_z[7]
-            )
+            else:
+                # Unknown components reuse the previous corner arrays in the
+                # original implementation, including its indexing errors.
+                if self._unique_inv is not None:
+                    vals_x = vals_x[self._unique_inv]
+                    vals_y = vals_y[self._unique_inv]
+                    vals_z = vals_z[self._unique_inv]
+            cell_eval_x = reduce_to_cells(vals_x)
+            cell_eval_y = reduce_to_cells(vals_y)
+            cell_eval_z = reduce_to_cells(vals_z)
             if self.model_type == "vector":
                 cell_vals = (
                     np.r_[cell_eval_x, cell_eval_y, cell_eval_z]
                 ) * self.survey.source_field.amplitude
             else:
+                if not magnetization_ready:
+                    # Reuse contiguous columns for each scalar contraction.
+                    if type(M) is np.ndarray and M.ndim == 2:
+                        M = np.asfortranarray(M)
+                    magnetization_ready = True
                 cell_vals = (
                     cell_eval_x * M[:, 0]
                     + cell_eval_y * M[:, 1]
